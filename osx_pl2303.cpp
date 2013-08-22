@@ -44,6 +44,7 @@
 #include <IOKit/IOTypes.h>
 #include <IOKit/IOMessage.h>
 
+#define DEBUG_LEVEL DEBUG_LEVEL_DEVELOPMENT
 
 #include "osx_pl2303.h"
 #include <IOKit/serial/IOSerialKeys.h>
@@ -55,10 +56,12 @@ extern "C" {
 #include <pexpert/pexpert.h>
 }
 
+#define FIX_PARITY_PROCESSING 1
+
 //To enable logging remove comments from #define DEBUG and #define DATALOG
 //Use USB Prober to monitor the logs.
-//#define DEBUG
-//#define DATALOG
+#define DEBUG
+#define DATALOG
 
 #ifdef DEBUG
 #define DEBUG_IOLog(args...) USBLog (args)
@@ -1220,16 +1223,14 @@ bool nl_bjaelectronics_driver_PL2303::startPipes( void )
     if(!fpPipeInMDP) goto Fail;
     if(!fpPipeOutMDP) goto Fail;
 
-	// Read the data-in bulk pipe
-	rtn = fpInPipe->Read(fpPipeInMDP, &fReadCompletionInfo, NULL );
-
-    if( !(rtn == kIOReturnSuccess) ) goto Fail;
-
 	// Read the data-in interrupt pipe
-    if(!fPort) goto Fail;
-
 	if(!fpinterruptPipeMDP) goto Fail;
 	rtn = fpInterruptPipe->Read(fpinterruptPipeMDP, &finterruptCompletionInfo, NULL );
+    if( !(rtn == kIOReturnSuccess) ) goto Fail;
+
+
+	// Read the data-in bulk pipe
+	rtn = fpInPipe->Read(fpPipeInMDP, &fReadCompletionInfo, NULL );
     if( !(rtn == kIOReturnSuccess) ) goto Fail;
 	
  
@@ -1344,7 +1345,7 @@ IOReturn err = kIOReturnSuccess;
 			break;
 			
 		case kIOMessageServiceIsAttemptingOpen:
-			DEBUG_IOLog(4,"%s(%p)::received kIOMessageServiceIsAttemptingOpen with argument: %p \n", getName(), this, (int) argument );
+			DEBUG_IOLog(4,"%s(%p)::received kIOMessageServiceIsAttemptingOpen with argument: %p \n", getName(), this, (long) argument );
 			
 			break;
 			
@@ -1941,16 +1942,35 @@ IOReturn nl_bjaelectronics_driver_PL2303::watchStateGated( UInt32 *state, UInt32
 //
 //      Outputs:    Return Code - kIOReturnSuccess
 //
-//      Desc:       Not used by this driver.
+//      Desc:       Returns either EOQ (no events), or.
 //
 /****************************************************************************************************/
 
 UInt32 nl_bjaelectronics_driver_PL2303::nextEvent( void *refCon )
 {
-    UInt32      ret = kIOReturnSuccess;
     DEBUG_IOLog(4,"%s(%p)::nextEvent\n", getName(), this);
-		
-    return ret;
+
+#if FIX_PARITY_PROCESSING
+    UInt8 t = 0;
+    UInt32 qret = peekBytefromQueue( &fPort->RX, &t, 1);
+    if(qret != kQueueEmpty) {
+        if(t == 0xff) {
+            qret = peekBytefromQueue( &fPort->RX, &t, 2);
+            if(qret != kQueueEmpty && t == 0x00) {
+                DEBUG_IOLog(5,"%s(%p)::nextEvent PD_E_INTEGRITY_ERROR\n", getName(), this);
+                return PD_E_INTEGRITY_ERROR;
+            }
+        }
+    }
+    
+    if(getQueueStatus(&fPort->RX) != kQueueEmpty) {
+        DEBUG_IOLog(5,"%s(%p)::nextEvent PD_E_VALID_DATA\n", getName(), this);
+        return PD_E_VALID_DATA;
+    }
+#endif
+
+    DEBUG_IOLog(5,"%s(%p)::nextEvent PD_E_EOQ\n", getName(), this);
+    return PD_E_EOQ;
     
 }/* end nextEvent */
 
@@ -2045,10 +2065,10 @@ IOReturn nl_bjaelectronics_driver_PL2303::executeEventGated( UInt32 event, UInt3
 			break;
 			
 		case PD_E_VALID_DATA_BYTE:
-			DEBUG_IOLog(4,"%s(%p)::executeEvent - PD_E_VALID_DATA_BYTE\n", getName(), this );
+			DEBUG_IOLog(6,"%s(%p)::executeEvent - PD_E_VALID_DATA_BYTE (0x%X)\n", getName(), this, data );
 			port->SWspecial[ data >> SPECIAL_SHIFT ] &= ~(1 << (data & SPECIAL_MASK));
 			break;
-			
+
 		case PD_E_FLOW_CONTROL:
 			
 			old = port->FlowControl;				    // save old modes for unblock checks
@@ -2667,6 +2687,21 @@ IOReturn nl_bjaelectronics_driver_PL2303::dequeueEvent( UInt32 *event, UInt32 *d
 	
     if ( readPortState( port ) & PD_S_ACTIVE )
 	{
+#ifdef FIX_PARITY_PROCESSING
+        *event = nextEvent(refCon);
+
+        if(*event == PD_E_EOQ)
+            return kIOReturnSuccess;
+
+        UInt8 Value;
+        getBytetoQueue(&fPort->RX, &Value);
+        *data = Value;
+
+        if(*event == PD_E_INTEGRITY_ERROR) {
+            getBytetoQueue(&fPort->RX, &Value);
+            getBytetoQueue(&fPort->RX, &Value); // Purge marker
+        }
+#endif
 		return kIOReturnSuccess;
 	}
 	
@@ -2916,9 +2951,30 @@ IOReturn nl_bjaelectronics_driver_PL2303::dequeueDataAction(OSObject *owner, voi
 	 *count = 0;
 	 if ( !(readPortState( fPort ) & PD_S_ACTIVE) )
 		 return kIOReturnNotOpen;
-	 
+
+     Queue = &fPort->RX;
+
+#if FIX_PARITY_PROCESSING
+     while (*count < size) {
+         UInt8 Value;
+         if(peekBytefromQueue(Queue, &Value, 1) != kQueueEmpty && Value == 0xff) {
+             if (peekBytefromQueue(Queue, &Value, 2) != kQueueEmpty && Value == 0x00) {
+                 return kIOReturnSuccess;
+             }
+         }
+         if( (rtn = getBytetoQueue(Queue, &Value)) != kIOReturnSuccess) {
+             if(rtn == kQueueEmpty)
+                 break;
+             IOLog("%s(%p)::dequeueDataGated - INTERRUPTED while reading\n", getName(), this );
+             return rtn;
+         }
+         *buffer++ = Value;
+         ++*count;
+     }
+#else
 	 /* Get any data living in the queue.    */
-	 *count = removefromQueue( &fPort->RX, buffer, size );
+	 *count = removefromQueue( Queue, buffer, size );
+#endif
 	 
 	 checkQueues( fPort );
 	 while ( (min > 0) && (*count < min) )	
@@ -2926,11 +2982,22 @@ IOReturn nl_bjaelectronics_driver_PL2303::dequeueDataAction(OSObject *owner, voi
 		 int count_read;
 		 
 		 /* Figure out how many bytes we have left to queue up */
-		 state = 0;
-		 Queue = &fPort->RX;
 		 DEBUG_IOLog(4,"%s(%p)::dequeueDataGated - min: %d count: %d size: %d SizeQueue: %d InQueue: %d \n", getName(), this,min,*count, (size - *count), Queue->Size, Queue->InQueue );
-		 
-		 rtn = watchStateGated( &state, PD_S_RXQ_EMPTY );
+         
+#if FIX_PARITY_PROCESSING
+		 for (int i = 0; i < 5; ++i) {
+             /* Always prefer waiting for HIGH_WATER to waiting a little bit more for not empty queue */
+             state = PD_S_RXQ_HIGH_WATER;
+             rtn = watchStateGated( &state, PD_S_RXQ_EMPTY | PD_S_RXQ_HIGH_WATER);
+             if(state & PD_S_RXQ_HIGH_WATER)
+                 break;
+             else
+                 IOSleep(1);
+         }
+#else
+         state = 0;
+         rtn = watchStateGated( &state, PD_S_RXQ_EMPTY);
+#endif
 		 
 		 if ( rtn != kIOReturnSuccess )
 		 {
@@ -2939,9 +3006,29 @@ IOReturn nl_bjaelectronics_driver_PL2303::dequeueDataAction(OSObject *owner, voi
 			 return rtn;
 		 }
 		 /* Try and get more data starting from where we left off */
+#if FIX_PARITY_PROCESSING
+         while (*count < size) {
+             UInt8 Value;
+             if(peekBytefromQueue(Queue, &Value, 1) != kQueueEmpty && Value == 0xff) {
+                 if (peekBytefromQueue(Queue, &Value, 2) != kQueueEmpty && Value == 0x00) {
+                     return kIOReturnSuccess;
+                 }
+             }
+             if( (rtn = getBytetoQueue(Queue, &Value)) != kIOReturnSuccess) {
+                 if(rtn == kQueueEmpty)
+                     break;
+                 IOLog("%s(%p)::dequeueDataGated - INTERRUPTED while reading\n", getName(), this );
+                 return rtn;
+             }
+             if(Value == 0xff)
+                 getBytetoQueue(Queue, &Value); // Read double 0xff
+             *buffer++ = Value;
+             ++*count;
+         }
+#else
 		 count_read = removefromQueue( &fPort->RX, buffer + *count, (size - *count) );
-		 
 		 *count += count_read;
+#endif
 		 checkQueues( fPort );
 		 
 	 }/* end while */
@@ -3156,7 +3243,17 @@ void nl_bjaelectronics_driver_PL2303::interruptReadComplete( void *obj, void *pa
 			if (buf[status_idx] & kCTS) stat |= PD_RS232_S_CTS;
 			if (buf[status_idx] & kDSR) stat |= PD_RS232_S_DSR;
 			if (buf[status_idx] & kRI)  stat |= PD_RS232_S_RI;
-			if (buf[status_idx] & kDCD) stat |= PD_RS232_S_CAR;		
+			if (buf[status_idx] & kDCD) stat |= PD_RS232_S_CAR;
+            // ++ Parity check
+            if(buf[status_idx] & kParityError) {
+#if FIX_PARITY_PROCESSING
+                DEBUG_IOLog(5,"nl_bjaelectronics_driver_PL2303::interruptReadComplete PARITY ERROR\n");
+                me->addBytetoQueue(&me->fPort->RX, 0xff); // Internal parity error marker
+                me->addBytetoQueue(&me->fPort->RX, 0x00); // Internal parity error marker
+#else
+                DEBUG_IOLog(5,"nl_bjaelectronics_driver_PL2303::interruptReadComplete PARITY ERROR (ignored)\n");
+#endif
+            }
             me->setStateGated( stat, kHandshakeInMask , port); // refresh linestate in State
 
 		}
@@ -3212,7 +3309,7 @@ void nl_bjaelectronics_driver_PL2303::dataReadComplete( void *obj, void *param, 
 				buflen--;
 			}
 
-#endif	
+#endif
 			ior = me->addtoQueue( &me->fPort->RX, &me->fPipeInBuffer[0], dtlength );
 		}
 		
@@ -3567,6 +3664,53 @@ Fail:
 
 /****************************************************************************************************/
 //
+//      Method:     nl_bjaelectronics_driver_PL2303::peekBytefromQueue
+//
+//      Inputs:     Queue - the queue to be peeked into, offset - index of byte to be peeked
+//
+//      Outputs:    Value - where to put the byte, Queue status - empty or no error
+//
+//      Desc:       Peek a byte from the circular queue.
+//
+/****************************************************************************************************/
+
+QueueStatus nl_bjaelectronics_driver_PL2303::peekBytefromQueue( CirQueue *Queue, UInt8 *Value, size_t offset = 0)
+{
+    DEBUG_IOLog(4,"%s(%p)::peekBytefromQueue\n", getName(), this );
+
+    if( !(fPort && fPort->serialRequestLock) ) goto Fail;
+	DEBUG_IOLog(2,"nl_bjaelectronics_driver_PL2303::peekBytefromQueue IOLockLock( port->serialRequestLock ); \n" );
+
+    IOLockLock( fPort->serialRequestLock );
+
+	/* Check to see if the queue has something in it.   */
+
+    if ( ((Queue->NextChar == Queue->LastChar) && !Queue->InQueue) || Queue->InQueue <= offset ) {
+		DEBUG_IOLog(2,"nl_bjaelectronics_driver_PL2303::peekBytefromQueue IOLockUnLock( port->serialRequestLock ); kQueueEmpty\n" );
+
+		IOLockUnlock(fPort->serialRequestLock);
+		return kQueueEmpty;
+	}
+
+    if(Queue->LastChar + offset >= Queue->End) {
+        *Value = *( Queue->Start + (offset - (Queue->End - Queue->LastChar)) );
+    } else
+        *Value = Queue->LastChar[offset];
+
+	DEBUG_IOLog(2,"nl_bjaelectronics_driver_PL2303::peekBytefromQueue IOLockUnLock( port->serialRequestLock ); kQueueNoError\n" );
+
+    IOLockUnlock(fPort->serialRequestLock);
+
+	DEBUG_IOLog(5,"nl_bjaelectronics_driver_PL2303::peekBytefromQueue offset = %u [0x%02x]\n", (unsigned) offset, *Value );
+    return kQueueNoError;
+
+Fail:
+    return kQueueEmpty;          // can't get to it, pretend it's empty
+
+}/* end peekBytefromQueue */
+
+/****************************************************************************************************/
+//
 //      Method:     nl_bjaelectronics_driver_PL2303::InitQueue
 //
 //      Inputs:     Queue - the queue to be initialized, Buffer - the buffer, size - length of buffer
@@ -3661,6 +3805,10 @@ size_t nl_bjaelectronics_driver_PL2303::addtoQueue( CirQueue *Queue, UInt8 *Buff
 	
     while ( freeSpaceinQueue( Queue ) && (Size > BytesWritten) )
 	{
+#if FIX_PARITY_PROCESSING
+        if(*Buffer == 0xff)
+            addBytetoQueue(Queue, 0xff);
+#endif
 		addBytetoQueue( Queue, *Buffer++ );
 		BytesWritten++;
 	}

@@ -422,6 +422,7 @@ private:
     
     QueueStatus     addBytetoQueue( CirQueue *Queue, char Value );
     QueueStatus     getBytetoQueue( CirQueue *Queue, UInt8 *Value );
+    QueueStatus     peekBytefromQueue( CirQueue *Queue, UInt8 *Value, size_t offset);
     QueueStatus     initQueue( CirQueue *Queue, UInt8 *Buffer, size_t Size );
     QueueStatus     closeQueue( CirQueue *Queue );
 	QueueStatus     flush( CirQueue *Queue );
