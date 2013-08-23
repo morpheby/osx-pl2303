@@ -76,6 +76,8 @@
 #define kMaxCirBufferSize   4096
 
 
+#define LAST_BYTE_COOLDOWN  100000
+#define BYTE_WAIT_PENALTY   2
 
 #define SPECIAL_SHIFT       (5)
 #define SPECIAL_MASK        ((1<<SPECIAL_SHIFT) - 1)
@@ -322,6 +324,10 @@ private:
     UInt8           fProductName[productNameLength];    // Actually the product String from the Device
     PortInfo_t      *fPort;         // The Port
     bool            fReadActive;    // usb read is active
+#if FIX_PARITY_PROCESSING
+    clock_sec_t			_fReadTimestampSecs;
+    clock_nsec_t        _fReadTimestampNanosecs;
+#endif
     bool            fWriteActive;   // usb write is active
     UInt8           fPowerState;    // off,on ordinal for power management
 	IORS232SerialStreamSync		*fNub;              // glue back to IOSerialStream side
